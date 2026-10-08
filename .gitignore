@@ -1,0 +1,11 @@
+/target/
+/.opencode/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.log
+*.tmp
+*-state.json
+auth.json
+codex-*.json

@@ -45,7 +45,8 @@ def callback(ctx, method, request, size, out):
         result = {'json': files[req['auth_index']]}
     elif method == 'host.auth.save':
         key = req['name'].removesuffix('.json')
-        assert key != 'unrestricted', 'Guard changed unrestricted account'
+        if key == 'unrestricted':
+            assert req['json']['disabled'] == files[key]['disabled'], 'Pacing must not impose a cutoff on unrestricted account'
         if not save_failure:
             files[key] = req['json']
     elif method == 'host.http.operation_open':
@@ -187,6 +188,28 @@ with tempfile.TemporaryDirectory(prefix='cpa-guard-test-') as home:
     files['protected']['codex_quota_guard_weekly_limit'] = 90
     refresh()
     assert not intercept('unrestricted').get('Terminate', False), 'Viktor-style unrestricted account remains untouched'
+    # Real DLL must publish reserve-aware weights without taking scheduler ownership.
+    files['unrestricted']['codex_quota_pacing'] = True
+    files['protected']['codex_quota_pacing'] = True
+    files['protected-two']['codex_quota_pacing'] = True
+    usage['unrestricted'] = 70
+    usage['protected'] = 70
+    usage['protected-two'] = 70
+    weekly_usage = 50
+    refresh()
+    assert files['unrestricted'].get('weight', 0) > files['protected'].get('weight', 0) > files['protected-two'].get('weight', 0) > 0, 'Reserve-aware new-session weights missing'
+    assert files['protected']['priority'] == 0 and files['protected']['refresh_token'] == 'preserve'
+    assert files['manual']['disabled'] and 'weight' not in files['manual']
+    http_failure = True
+    refresh()
+    assert not files['unrestricted']['disabled'] and files['unrestricted']['weight'] == 1, 'Unknown unrestricted capacity reduces assignment, not hard eligibility'
+    assert files['protected']['disabled'] and files['protected-two']['disabled'], 'Pacing cannot weaken reserve fail-closed policy'
+    http_failure = False
+    weekly_usage = 10
+    usage['unrestricted'] = usage['protected'] = usage['protected-two'] = 0
+    refresh()
+    assert not files['protected']['disabled'] and not files['protected-two']['disabled']
+    assert all(files[k]['weight'] > 1 for k in ['unrestricted','protected','protected-two'])
     call('plugin.quiesce')
     plugin.shutdown()
     assert not allocations

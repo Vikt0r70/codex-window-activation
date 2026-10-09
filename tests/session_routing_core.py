@@ -4,6 +4,7 @@ Set CPA_CORE_EXE to an existing core. Set CPA_SLEEV_URL optionally to test
 the running Sleev forwarding boundary too. Never uses real OAuth credentials.
 """
 import http.server
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -56,9 +57,13 @@ try:
         pool = {'name': 'fixture-pool', 'base-url': f'http://127.0.0.1:{server.server_port}/v1',
                 'api-key-entries': [{'api-key': key} for key in ['fixture-a', 'fixture-b', 'fixture-c']],
                 'models': [{'name': 'fixture-model', 'alias': 'fixture-model'}]}
+        weighted = os.environ.get('CPA_WEIGHTED_TEST') == '1'
+        if weighted:
+            for entry, weight in zip(pool['api-key-entries'], [1, 3, 1]):
+                entry['weight'] = weight
         cfg = {'host': '127.0.0.1', 'port': port, 'auth-dir': str(root/'auth'),
                'api-keys': ['same-client-key'], 'request-retry': 0,
-               'routing': {'strategy': 'round-robin', 'session-affinity': True,
+               'routing': {'strategy': 'weighted-round-robin' if weighted else 'round-robin', 'session-affinity': True,
                            'session-affinity-ttl': '24h', 'session-affinity-subagents': True},
                'openai-compatibility': [pool],
                'plugins': {'enabled': True, 'dir': str(root/'plugins'),
@@ -101,7 +106,16 @@ try:
 
                 sessions = ['conversation-one', 'conversation-two', 'conversation-three']
                 bindings = {s: call(s) for s in sessions}
-                assert len(set(bindings.values())) == 3, bindings
+                if weighted:
+                    sample = Counter(call('weighted-new-'+str(i)) for i in range(30))
+                    assert sample == Counter({'fixture-a': 6, 'fixture-b': 18, 'fixture-c': 6}), sample
+                    for entry in pool['api-key-entries']:
+                        entry['weight'] = 3 if entry['api-key'] == 'fixture-a' else 1
+                    save()
+                    time.sleep(1)
+                    assert all(call(s) == bindings[s] for s in sessions), 'Weight update moved warm sessions'
+                else:
+                    assert len(set(bindings.values())) == 3, bindings
                 for s in sessions:
                     assert call(s) == bindings[s], 'Repeat turn lost account binding'
                 assert call('child-session', sessions[0]) == bindings[sessions[0]], 'Child lost parent affinity'
@@ -111,7 +125,11 @@ try:
                 time.sleep(1)
                 assert call(sessions[0]) != removed, 'Unavailable binding failed to move'
                 for s in sessions[1:]:
-                    assert call(s) == bindings[s], 'Unrelated session moved'
+                    result = call(s)
+                    if bindings[s] == removed:
+                        assert result != removed, 'Affected session failed to move'
+                    else:
+                        assert result == bindings[s], 'Unrelated session moved'
                 cfg['openai-compatibility'] = []
                 save()
                 time.sleep(1)
@@ -123,7 +141,8 @@ try:
                     assert error.code >= 400
                 assert len(seen) == before, 'Empty pool sent an upstream request'
                 print('PASS actual CPA + guard' + (' + Sleev' if gateway else '') +
-                      ': shared client key, 3 sessions spread, repeat affinity, child affinity, '
+                      (': weighted 6/18/6 distribution and warm weight-update affinity, ' if weighted else ': 3 sessions spread, ') +
+                      'shared client key, repeat affinity, child affinity, '
                       'only unavailable session moves, empty pool stops; zero real quota')
             finally:
                 proc.terminate()

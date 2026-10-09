@@ -117,7 +117,7 @@ python tests\session_routing_core.py
 ```
 
 Install `target/quota-guard/release/codex_window_activation.dll` as
-`codex-quota-guard-v0.2.1.dll`; enable `plugins.configs.codex-quota-guard.enabled`.
+`codex-quota-guard-v0.3.0.dll`; enable `plugins.configs.codex-quota-guard.enabled`.
 For each protected **existing** Codex OAuth JSON, set
 `"codex_quota_guard_limit": 80` for a 20% remaining five-hour reserve, or `90`
 for a 10% remaining reserve. Add `"codex_quota_guard_weekly_limit": 90` to stop
@@ -157,6 +157,56 @@ Other gateways/direct account usage are outside its protection.
 API-key credentials and a local mock provider, with the guard installed. It checks
 new-session distribution, repeated-turn and parent/child affinity, isolated
 failover, and empty-pool failure. It sends no real provider requests.
+
+### Reserve-aware new-session pacing
+
+Version 0.3.0 optionally feeds weights into CPA's **native weighted-round-robin**;
+it does not register a scheduler or maintain a second set of session bindings.
+Changing the routing strategy rebuilds CPA's selector and can lose existing
+bindings once at deployment. Later weight-only updates preserve warm bindings.
+Set `routing.strategy: weighted-round-robin`, retain session affinity and equal
+credential priorities, and add `"codex_quota_pacing": true` to each participating
+Codex credential, including unrestricted accounts. Omit it to opt out. Do not
+enable another weight/priority writer alongside this implementation.
+
+The 30-second worker and pre-selection refresh read both real quota windows,
+subtract each account's configured reserve, and use the more constrained window.
+For each window, `capacity = max(0, limit-used)/limit` and
+`score = capacity * (1 + capacity - fraction_of_window_until_reset)`.
+The smaller score determines a positive native weight (1 to 2000). This considers
+both available budget and reset opportunity without treating an elapsed reset as
+replenishment. The guard remains authoritative at either configured hard limit.
+
+Recent measured five-hour consumption further reduces new-session weight if the
+remaining allowance would be consumed within 15 minutes at that observed rate.
+Samples span at least 60 seconds; decreases/new reset identities clear the
+estimate, and ten minutes without observed consumption expires it. This is
+account-level pressure, not a prediction of individual session cost. Estimates
+start cold after a restart; live quotas still set the initial weights.
+
+Healthy weights never become zero, because zero would exclude even an existing
+warm binding. Consequently this reduces, but does not prohibit, new assignments
+near a cutoff. Existing sessions stay pinned until native availability/failover
+rules or your hard guard require a move. No model/context-specific token-to-quota
+conversion is invented. The algorithm is a heuristic, not a guaranteed optimum.
+
+Missing/stale-reset pacing windows get weight 1; protected quota failures still
+pause under the existing fail-closed policy. Unrestricted accounts are not
+disabled on pacing-read failure. Manual pauses, priorities and tokens are
+preserved. Weights are written only when changed, using latest credential JSON
+and `host.auth.save`, shared with the guard under one lock. Like the existing
+guard saves, this is not an atomic field-compare-and-swap against every external
+credential editor. Reported status includes weights and consumption estimates.
+
+Run the actual-core weighted characterization test without real inference:
+
+```powershell
+$env:CPA_WEIGHTED_TEST = '1'
+python tests\session_routing_core.py
+```
+
+It verifies the weighted distribution, warm bindings after weight updates,
+parent/child locality, affected-session failover and empty-pool failure.
 
 ## Project-local GSD for OpenCode
 

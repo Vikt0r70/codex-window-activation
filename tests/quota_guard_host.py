@@ -31,6 +31,8 @@ http_failure = False
 missing_window = False
 save_failure = False
 past_reset = False
+weekly_usage = 100
+missing_weekly = False
 
 @HostCall
 def callback(ctx, method, request, size, out):
@@ -54,9 +56,11 @@ def callback(ctx, method, request, size, out):
         assert req['method'] == 'GET', 'Guard must not send inference'
         key = req['headers']['Chatgpt-Account-Id'][0]
         reads.append(key)
-        q = {'rate_limit': {'primary_window': {'limit_window_seconds': 18000, 'used_percent': usage[key], 'reset_at': int(time.time())+(-10 if past_reset else 18000)}, 'secondary_window': {'limit_window_seconds': 604800, 'used_percent': 100, 'reset_at': int(time.time())+604800}}}
+        q = {'rate_limit': {'primary_window': {'limit_window_seconds': 18000, 'used_percent': usage[key], 'reset_at': int(time.time())+(-10 if past_reset else 18000)}, 'secondary_window': {'limit_window_seconds': 604800, 'used_percent': weekly_usage, 'reset_at': int(time.time())+604800}}}
         if missing_window:
             del q['rate_limit']['primary_window']
+        if missing_weekly:
+            del q['rate_limit']['secondary_window']
         result = {'StatusCode': 503 if http_failure else 200, 'Body': base64.b64encode(json.dumps(q).encode()).decode()}
     else:
         raise AssertionError(method)
@@ -151,7 +155,39 @@ with tempfile.TemporaryDirectory(prefix='cpa-guard-test-') as home:
     usage['protected-two'] = 79
     refresh()
     assert files['protected']['disabled'] and not files['protected-two']['disabled'], 'Only recovering account may restore'
+    # Independent per-account reserves and weekly cap; 90 used = 10 remaining.
+    files['protected']['codex_quota_guard_limit'] = 90
+    files['protected']['codex_quota_guard_weekly_limit'] = 90
+    files['protected-two']['codex_quota_guard_weekly_limit'] = 90
+    usage['protected'] = 89
+    usage['protected-two'] = 79
+    weekly_usage = 89
+    refresh()
+    assert not intercept('protected').get('Terminate', False), '89 used must allow the 10% 5h reserve account'
+    assert not intercept('protected-two').get('Terminate', False), '79 used must allow the 20% 5h reserve account'
+    usage['protected'] = 90
+    usage['protected-two'] = 80
+    assert intercept('protected')['Terminate'] and intercept('protected-two')['Terminate'], 'Independent 5h boundaries must block'
+    usage['protected'] = 0
+    usage['protected-two'] = 0
+    weekly_usage = 90
+    refresh()
+    assert files['protected']['disabled'] and files['protected-two']['disabled'], '5h reset must not lift weekly cutoff'
+    assert intercept('protected')['Terminate'], 'Weekly 90 used must veto even with fresh 5h quota'
+    weekly_usage = 89
+    refresh()
+    assert not files['protected']['disabled'] and not files['protected-two']['disabled'], 'Both safe windows may recover'
+    missing_weekly = True
+    assert intercept('protected')['Terminate'], 'Configured but missing weekly quota must fail closed'
+    missing_weekly = False
+    refresh()
+    assert not files['protected']['disabled']
+    files['protected']['codex_quota_guard_weekly_limit'] = 'invalid'
+    assert intercept('protected')['Terminate'], 'Malformed weekly policy must fail closed'
+    files['protected']['codex_quota_guard_weekly_limit'] = 90
+    refresh()
+    assert not intercept('unrestricted').get('Terminate', False), 'Viktor-style unrestricted account remains untouched'
     call('plugin.quiesce')
     plugin.shutdown()
     assert not allocations
-    print('PASS native guard: 79 allowed, 80 vetoed, ownership/recovery, no clock-only recovery, HTTP/missing quota/disk fail closed, weekly ignored, unrestricted/manual preserved, no inference, native scheduler preserved, shutdown')
+    print('PASS native guard: independent 80/90 5h cutoffs, optional 90 weekly cutoff, both-window recovery, missing/malformed quota fail closed, legacy weekly-unrestricted policy, manual/unrestricted preserved, no inference, affinity preserved, shutdown')

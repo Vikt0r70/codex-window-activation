@@ -23,7 +23,7 @@ Never commit credential files, tokens, live quota records, or real test output.
   bounded attempts, cancelable HTTP, and safe DLL shutdown.
 - Activation is not quota replenishment and not an 80% usage cap.
 - The optional guard build is a separate plugin. Preserve native scheduler
-  ownership, weekly-independent cutoff, explicit error veto, live-quota
+  ownership, independent optional five-hour/weekly cutoffs, explicit error veto, live-quota
   recovery, guard-owned pauses, and token preservation. Never enable both
   reset-activation implementations alongside Lamplighter.
 - Do not change installed gateway configuration or deploy DLLs automatically.

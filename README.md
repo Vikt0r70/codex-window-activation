@@ -117,14 +117,18 @@ python tests\session_routing_core.py
 ```
 
 Install `target/quota-guard/release/codex_window_activation.dll` as
-`codex-quota-guard-v0.2.0.dll`; enable `plugins.configs.codex-quota-guard.enabled`.
-For each protected **existing** Codex OAuth JSON, add only
-`"codex_quota_guard_limit": 80` (percent used). Omit the field for unrestricted
-accounts. Never share those credential files. All participating accounts should
+`codex-quota-guard-v0.2.1.dll`; enable `plugins.configs.codex-quota-guard.enabled`.
+For each protected **existing** Codex OAuth JSON, set
+`"codex_quota_guard_limit": 80` for a 20% remaining five-hour reserve, or `90`
+for a 10% remaining reserve. Add `"codex_quota_guard_weekly_limit": 90` to stop
+at 10% weekly remaining. These fields are **percent used**, not percent remaining.
+Each window is optional; omit both for unrestricted accounts. Never share those
+credential files. All participating accounts should
 have equal CPA priority for round-robin distribution of new sessions.
 
-The guard reads live 18,000-second quota every 30 seconds and at protected
-request boundaries. It ignores weekly usage, persists `disabled:true` plus
+The guard reads configured live 18,000-second and 604,800-second windows every
+30 seconds and at protected request boundaries. Either configured cutoff pauses
+the account; unconfigured windows do not trigger the guard. It persists `disabled:true` plus
 `codex_quota_guard_paused:true` at cutoff or quota-read failure, and updates the
 core through `host.auth.save`. A selected protected request is explicitly vetoed
 if quota cannot be verified or is already at the cutoff, including explicit
@@ -132,8 +136,9 @@ credential pins. Native CPA selects another eligible account after the pause;
 the request that discovers the cutoff can return 429 and need a retry. If no
 eligible accounts remain, the request fails rather than spending the reserve.
 
-Only guard-owned pauses are lifted after a successful live 5h reading below the
-limit. A passed clock deadline alone is insufficient. To manually disable an
+Only guard-owned pauses are lifted after successful live readings below **all
+configured limits**. A five-hour reset cannot clear a weekly cutoff. A passed
+clock deadline alone is insufficient. To manually disable an
 already guard-paused account permanently, remove `codex_quota_guard_paused` while
 leaving `disabled:true`. Unknown or malformed quota fails closed. Expired tokens
 can therefore pause protected accounts until CPA refreshes credentials or you
@@ -145,7 +150,7 @@ Authenticated management endpoints:
 `POST /v0/management/plugins/codex-quota-guard/refresh`.
 Status never contains OAuth tokens. HTTP cancellation is bounded to 45 seconds;
 quota verification can add latency. Already-running requests and provider quota
-reporting lag can overshoot 80%; this is **not** a mathematical 80.000% ceiling.
+reporting lag can overshoot the configured limit; this is **not** an exact ceiling.
 Other gateways/direct account usage are outside its protection.
 
 `tests/session_routing_core.py` runs the actual CPA executable with three fake

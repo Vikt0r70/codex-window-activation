@@ -3,34 +3,45 @@ use super::*;
 static GATE: Mutex<()> = Mutex::new(());
 
 pub fn capped(quota: &Value, limit: f64, _now: i64) -> Result<bool, String> {
+    Ok(window_usage(quota, 18000)?.0 >= limit)
+}
+
+fn window_usage(quota: &Value, seconds: i64) -> Result<(f64, i64), String> {
     let mut found = None;
     for key in ["primary_window", "secondary_window"] {
         let w = &quota["rate_limit"][key];
-        if w["limit_window_seconds"].as_i64() != Some(18000) {
+        if w["limit_window_seconds"].as_i64() != Some(seconds) {
             continue;
         }
         if found.is_some() {
-            return Err("Ambiguous five-hour quota".into());
+            return Err("Ambiguous configured quota window".into());
         }
         let used = w["used_percent"]
             .as_f64()
-            .ok_or("Missing five-hour usage")?;
+            .ok_or("Missing configured window usage")?;
         if !(0.0..=100.0).contains(&used) || w["reset_at"].as_i64().unwrap_or(0) <= 0 {
-            return Err("Invalid five-hour quota".into());
+            return Err("Invalid configured quota window".into());
         }
-        found = Some(used >= limit);
+        found = Some((used, w["reset_at"].as_i64().unwrap()));
     }
-    found.ok_or("Missing five-hour quota".into())
+    found.ok_or("Missing configured quota window".into())
 }
 
 fn check(file: &Value) -> Result<Value, String> {
     let index = file["auth_index"].as_str().ok_or("Missing auth index")?;
     let name = file["name"].as_str().ok_or("Missing auth filename")?;
     let mut auth = host("host.auth.get", json!({"auth_index":index}))?["json"].clone();
-    if auth.get("codex_quota_guard_limit").is_none() {
+    if auth.get("codex_quota_guard_limit").is_none()
+        && auth.get("codex_quota_guard_weekly_limit").is_none()
+    {
         return Ok(json!({"auth_index":index,"protected":false,"blocked":false}));
     }
-    let limit = auth["codex_quota_guard_limit"].as_f64().unwrap_or(f64::NAN);
+    let limit = auth
+        .get("codex_quota_guard_limit")
+        .map(|v| v.as_f64().unwrap_or(f64::NAN));
+    let weekly_limit = auth
+        .get("codex_quota_guard_weekly_limit")
+        .map(|v| v.as_f64().unwrap_or(f64::NAN));
     let owned = auth["codex_quota_guard_paused"] == true;
     if (auth["disabled"] == true || file["disabled"] == true) && !owned {
         return Ok(
@@ -38,7 +49,11 @@ fn check(file: &Value) -> Result<Value, String> {
         );
     }
     let reading = (|| {
-        if !(0.0..100.0).contains(&limit) {
+        if [limit, weekly_limit]
+            .into_iter()
+            .flatten()
+            .any(|v| !(0.0..100.0).contains(&v))
+        {
             return Err("Invalid guard threshold".into());
         }
         // The host global HTTP transport does not honor per-auth proxies. Refuse
@@ -55,26 +70,30 @@ fn check(file: &Value) -> Result<Value, String> {
             None,
         )?;
         let q: Value = serde_json::from_slice(&raw).map_err(|_| "Invalid quota response")?;
-        let block = capped(&q, limit, now())?;
-        let w = ["primary_window", "secondary_window"]
-            .into_iter()
-            .map(|k| &q["rate_limit"][k])
-            .find(|w| w["limit_window_seconds"] == 18000)
-            .unwrap();
-        Ok((block, w["used_percent"].clone(), w["reset_at"].clone()))
-    })();
-    let (blocked, used, reset, status) = match reading {
-        Ok((b, u, r)) => (
-            b,
-            u,
-            r,
-            if b {
-                "five-hour cutoff reached".to_owned()
+        let five = limit.map(|_| window_usage(&q, 18000)).transpose()?;
+        let weekly = weekly_limit.map(|_| window_usage(&q, 604800)).transpose()?;
+        let five_blocked = five
+            .zip(limit)
+            .is_some_and(|((used, _), threshold)| used >= threshold);
+        let weekly_blocked = weekly
+            .zip(weekly_limit)
+            .is_some_and(|((used, _), threshold)| used >= threshold);
+        Ok((
+            five_blocked || weekly_blocked,
+            five,
+            weekly,
+            if weekly_blocked {
+                "weekly cutoff reached"
+            } else if five_blocked {
+                "five-hour cutoff reached"
             } else {
-                "live quota below cutoff".to_owned()
+                "live quota below all configured cutoffs"
             },
-        ),
-        Err(e) => (true, Value::Null, Value::Null, e),
+        ))
+    })();
+    let (blocked, five, weekly, status) = match reading {
+        Ok((b, f, w, s)) => (b, f, w, s.to_owned()),
+        Err(e) => (true, None, None, e),
     };
     if blocked && (!owned || auth["disabled"] != true) {
         // Quota HTTP can overlap the core's OAuth refresh. Re-read immediately
@@ -96,7 +115,9 @@ fn check(file: &Value) -> Result<Value, String> {
     }
     Ok(
         json!({"auth_index":index,"protected":true,"blocked":blocked,"limit_used_percent":limit,
-        "five_hour_used_percent":used,"reset_at":reset,"status":status,"checked_at":now()}),
+        "five_hour_used_percent":five.map(|w|w.0),"reset_at":five.map(|w|w.1),
+        "weekly_limit_used_percent":weekly_limit,"weekly_used_percent":weekly.map(|w|w.0),
+        "weekly_reset_at":weekly.map(|w|w.1),"status":status,"checked_at":now()}),
     )
 }
 
@@ -184,7 +205,7 @@ pub fn handle(method: &str, req: &Value) -> Result<Value, String> {
                 }
             }));
             Ok(
-                json!({"schema_version":6,"metadata":{"Name":ID,"Version":"0.2.0","Author":"Local quota policy","GitHubRepository":"https://github.com/Vikt0r70/codex-window-activation","ConfigFields":[]},
+                json!({"schema_version":6,"metadata":{"Name":ID,"Version":"0.2.1","Author":"Local quota policy","GitHubRepository":"https://github.com/Vikt0r70/codex-window-activation","ConfigFields":[]},
                 "capabilities":{"management_api":true,"request_interceptor":true}}),
             )
         }

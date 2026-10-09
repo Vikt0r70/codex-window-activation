@@ -94,6 +94,65 @@ plugin list reports `registered: true` and `effective_enabled: true`, then check
 the authenticated status endpoint above. Do not assume that copying the DLL
 alone activates it.
 
+## Optional quota guard build
+
+The `quota-guard` feature builds a **different plugin**, `codex-quota-guard`,
+reusing only the ABI and cancelable HTTP implementation. It does not send reset
+prompts or replace CPA's scheduler. Use native round-robin + session affinity for
+session distribution and Lamplighter as the single reset-activation owner. Do not
+enable the original reset-activation DLL alongside Lamplighter.
+
+```powershell
+cargo test --offline --features quota-guard
+cargo clippy --offline --all-targets --features quota-guard -- -D warnings
+cargo build --release --offline --features quota-guard --target-dir target/quota-guard
+python tests\quota_guard_host.py
+# Optional isolated real-core test, using an already installed executable:
+$env:CPA_CORE_EXE = 'C:\path\to\cli-proxy-api.exe'
+python tests\quota_guard_core.py
+python tests\session_routing_core.py
+# Optional: include your running Sleev in the local-only routing fixture:
+$env:CPA_SLEEV_URL = 'http://127.0.0.1:17321/v1'
+python tests\session_routing_core.py
+```
+
+Install `target/quota-guard/release/codex_window_activation.dll` as
+`codex-quota-guard-v0.2.0.dll`; enable `plugins.configs.codex-quota-guard.enabled`.
+For each protected **existing** Codex OAuth JSON, add only
+`"codex_quota_guard_limit": 80` (percent used). Omit the field for unrestricted
+accounts. Never share those credential files. All participating accounts should
+have equal CPA priority for round-robin distribution of new sessions.
+
+The guard reads live 18,000-second quota every 30 seconds and at protected
+request boundaries. It ignores weekly usage, persists `disabled:true` plus
+`codex_quota_guard_paused:true` at cutoff or quota-read failure, and updates the
+core through `host.auth.save`. A selected protected request is explicitly vetoed
+if quota cannot be verified or is already at the cutoff, including explicit
+credential pins. Native CPA selects another eligible account after the pause;
+the request that discovers the cutoff can return 429 and need a retry. If no
+eligible accounts remain, the request fails rather than spending the reserve.
+
+Only guard-owned pauses are lifted after a successful live 5h reading below the
+limit. A passed clock deadline alone is insufficient. To manually disable an
+already guard-paused account permanently, remove `codex_quota_guard_paused` while
+leaving `disabled:true`. Unknown or malformed quota fails closed. Expired tokens
+can therefore pause protected accounts until CPA refreshes credentials or you
+re-authenticate. Per-account proxy overrides are unsupported and fail closed.
+Keep the guard enabled: its absence/disabling removes request-time enforcement.
+
+Authenticated management endpoints:
+`GET /v0/management/plugins/codex-quota-guard/status` and
+`POST /v0/management/plugins/codex-quota-guard/refresh`.
+Status never contains OAuth tokens. HTTP cancellation is bounded to 45 seconds;
+quota verification can add latency. Already-running requests and provider quota
+reporting lag can overshoot 80%; this is **not** a mathematical 80.000% ceiling.
+Other gateways/direct account usage are outside its protection.
+
+`tests/session_routing_core.py` runs the actual CPA executable with three fake
+API-key credentials and a local mock provider, with the guard installed. It checks
+new-session distribution, repeated-turn and parent/child affinity, isolated
+failover, and empty-pool failure. It sends no real provider requests.
+
 ## Project-local GSD for OpenCode
 
 GSD is development tooling, not a runtime dependency of the DLL. Install it from

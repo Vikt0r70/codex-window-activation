@@ -1,8 +1,6 @@
 use serde_json::{json, Value};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
-    fs,
-    path::PathBuf,
     ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -11,8 +9,15 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(not(feature = "quota-guard"))]
+use std::{fs, path::PathBuf};
 
+#[cfg(not(feature = "quota-guard"))]
 const ID: &str = "codex-window-activation";
+#[cfg(feature = "quota-guard")]
+const ID: &str = "codex-quota-guard";
+#[cfg(feature = "quota-guard")]
+pub mod guard;
 const USER_AGENT: &str =
     "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)";
 
@@ -96,6 +101,7 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+#[cfg(not(feature = "quota-guard"))]
 fn state_path() -> PathBuf {
     PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default())
         .join(".cli-proxy-api")
@@ -260,6 +266,7 @@ fn http(method: &str, url: &str, auth: &Value, body: Option<Value>) -> Result<Ve
     decode_body(&response["Body"])
 }
 
+#[cfg(not(feature = "quota-guard"))]
 fn quota(auth: &Value) -> Result<Vec<Window>, String> {
     let bytes = http(
         "GET",
@@ -269,6 +276,7 @@ fn quota(auth: &Value) -> Result<Vec<Window>, String> {
     )?;
     windows(&serde_json::from_slice(&bytes).map_err(|_| "Invalid usage response")?)
 }
+#[cfg(not(feature = "quota-guard"))]
 fn activate(auth: &Value) -> Result<(), String> {
     let bytes = http(
         "POST",
@@ -291,6 +299,7 @@ fn activate(auth: &Value) -> Result<(), String> {
     Err("No successful inference completion".into())
 }
 
+#[cfg(not(feature = "quota-guard"))]
 fn save(state: &Value) -> Result<(), String> {
     let path = state_path();
     let tmp = path.with_extension("tmp");
@@ -300,6 +309,7 @@ fn save(state: &Value) -> Result<(), String> {
     fs::rename(tmp, path).map_err(|_| "Cannot commit state".to_owned())
 }
 
+#[cfg(not(feature = "quota-guard"))]
 fn poll(state: &mut Value) -> Result<(), String> {
     let files = host("host.auth.list", json!({}))?;
     let files = files["files"].as_array().ok_or("Missing accounts list")?;
@@ -398,6 +408,7 @@ fn poll(state: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(feature = "quota-guard"))]
 fn start() -> Result<(), String> {
     stop();
     STOP.store(false, Ordering::SeqCst);
@@ -436,6 +447,9 @@ fn stop() {
 }
 
 fn handle(method: &str, _req: &Value) -> Result<Value, String> {
+    #[cfg(feature = "quota-guard")]
+    return guard::handle(method, _req);
+    #[cfg(not(feature = "quota-guard"))]
     match method {
         "plugin.register" | "plugin.reconfigure" => {
             start()?;
@@ -515,6 +529,21 @@ unsafe extern "C" fn plugin_call(
         };
         handle(m, &req)
     });
+    #[cfg(feature = "quota-guard")]
+    let result = if !matches!(result, Ok(Ok(_)))
+        && !method.is_null()
+        && matches!(
+            CStr::from_ptr(method).to_bytes(),
+            b"request.intercept_before" | b"request.intercept_after"
+        ) {
+        // CPA ignores interceptor errors. A guard error/panic must instead
+        // become an explicit upstream veto, not a successful transport error.
+        Ok(Ok(guard::terminal(
+            "Quota guard failed; no upstream request permitted.",
+        )))
+    } else {
+        result
+    };
     let envelope = match result {
         Ok(Ok(v)) => json!({"ok":true,"result":v}),
         Ok(Err(e)) => json!({"ok":false,"error":{"code":"plugin_error","message":e}}),
@@ -534,6 +563,9 @@ unsafe extern "C" fn plugin_free(p: *mut c_void, len: usize) {
     }
 }
 unsafe extern "C" fn plugin_shutdown() {
+    #[cfg(feature = "quota-guard")]
+    guard::stop();
+    #[cfg(not(feature = "quota-guard"))]
     stop();
 }
 
